@@ -14,12 +14,25 @@
  * limitations under the License.
  */
 
+#include "ext4_utils.h"
+#include "uuid.h"
+#include "allocate.h"
+#include "indirect.h"
+#include "extent.h"
+
+#include <sparse/sparse.h>
+
 #include <fcntl.h>
-#include <arpa/inet.h>
-#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <string.h>
+
+#ifdef USE_MINGW
+#include <winsock2.h>
+#else
+#include <arpa/inet.h>
+#include <sys/ioctl.h>
+#endif
 
 #if defined(__linux__)
 #include <linux/fs.h>
@@ -27,20 +40,14 @@
 #include <sys/disk.h>
 #endif
 
-#include "ext4_utils.h"
-#include "output_file.h"
-#include "backed_block.h"
-#include "uuid.h"
-#include "allocate.h"
-#include "indirect.h"
-#include "extent.h"
-
 #include "ext4.h"
 #include "jbd2.h"
 
 int force = 0;
 struct fs_info info;
 struct fs_aux_info aux_info;
+
+jmp_buf setjmp_env;
 
 /* returns 1 if a is a power of b */
 static int is_power_of(int a, int b)
@@ -74,38 +81,9 @@ int ext4_bg_has_super_block(int bg)
 }
 
 /* Write the filesystem image to a file */
-void write_ext4_image(const char *filename, int gz, int sparse)
+void write_ext4_image(int fd, int gz, int sparse, int crc)
 {
-	int ret = 0;
-	struct output_file *out = open_output_file(filename, gz, sparse);
-	off_t off;
-
-	if (!out)
-		return;
-
-	/* The write_data* functions expect only block aligned calls.
-	 * This is not an issue, except when we write out the super
-	 * block on a system with a block size > 1K.  So, we need to
-	 * deal with that here.
-	 */
-	if (info.block_size > 1024) {
-		u8 buf[4096] = { 0 }; 	/* The larget supported ext4 block size */
-		memcpy(buf + 1024, (u8*)aux_info.sb, 1024);
-		write_data_block(out, 0, buf, info.block_size);
-
-	} else {
-		write_data_block(out, 1024, (u8*)aux_info.sb, 1024);
-	}
-
-	write_data_block(out, (u64)(aux_info.first_data_block + 1) * info.block_size,
-			 (u8*)aux_info.bg_desc,
-			 aux_info.bg_desc_blocks * info.block_size);
-
-	for_each_data_block(write_data_block, write_data_file, out);
-
-	pad_output_file(out, info.len);
-
-	close_output_file(out);
+	sparse_file_write(info.sparse_file, fd, gz, sparse, crc);
 }
 
 /* Compute the rest of the parameters of the filesystem from the basic info */
@@ -125,26 +103,22 @@ void ext4_create_fs_aux_info()
 		DIV_ROUND_UP(aux_info.groups * sizeof(struct ext2_group_desc),
 			info.block_size);
 
-	aux_info.bg_desc_reserve_blocks =
-		DIV_ROUND_UP(aux_info.groups * 1024 * sizeof(struct ext2_group_desc),
-			info.block_size) - aux_info.bg_desc_blocks;
-
-	if (aux_info.bg_desc_reserve_blocks > aux_info.blocks_per_ind)
-		aux_info.bg_desc_reserve_blocks = aux_info.blocks_per_ind;
-
 	aux_info.default_i_flags = EXT4_NOATIME_FL;
 
 	u32 last_group_size = aux_info.len_blocks % info.blocks_per_group;
 	u32 last_header_size = 2 + aux_info.inode_table_blocks;
 	if (ext4_bg_has_super_block(aux_info.groups - 1))
 		last_header_size += 1 + aux_info.bg_desc_blocks +
-			aux_info.bg_desc_reserve_blocks;
+			info.bg_desc_reserve_blocks;
 	if (last_group_size > 0 && last_group_size < last_header_size) {
 		aux_info.groups--;
 		aux_info.len_blocks -= last_group_size;
 	}
 
 	aux_info.sb = calloc(info.block_size, 1);
+	/* Alloc an array to hold the pointers to the backup superblocks */
+	aux_info.backup_sb = calloc(aux_info.groups, sizeof(char *));
+
 	if (!aux_info.sb)
 		critical_error_errno("calloc");
 
@@ -155,6 +129,12 @@ void ext4_create_fs_aux_info()
 
 void ext4_free_fs_aux_info()
 {
+	unsigned int i;
+
+	for (i=0; i<aux_info.groups; i++) {
+		if (aux_info.backup_sb[i])
+			free(aux_info.backup_sb[i]);
+	}
 	free(aux_info.sb);
 	free(aux_info.bg_desc);
 }
@@ -203,7 +183,7 @@ void ext4_fill_in_sb()
 	memset(sb->s_last_mounted, 0, sizeof(sb->s_last_mounted));
 	sb->s_algorithm_usage_bitmap = 0;
 
-	sb->s_reserved_gdt_blocks = aux_info.bg_desc_reserve_blocks;
+	sb->s_reserved_gdt_blocks = info.bg_desc_reserve_blocks;
 	sb->s_prealloc_blocks = 0;
 	sb->s_prealloc_dir_blocks = 0;
 
@@ -242,12 +222,17 @@ void ext4_fill_in_sb()
 		u32 header_size = 0;
 		if (ext4_bg_has_super_block(i)) {
 			if (i != 0) {
-				queue_data_block((u8 *)sb, info.block_size, group_start_block);
-				queue_data_block((u8 *)aux_info.bg_desc,
-					aux_info.bg_desc_blocks * info.block_size,
-					group_start_block + 1);
+				aux_info.backup_sb[i] = calloc(info.block_size, 1);
+				memcpy(aux_info.backup_sb[i], sb, info.block_size);
+				/* Update the block group nr of this backup superblock */
+				aux_info.backup_sb[i]->s_block_group_nr = i;
+				sparse_file_add_data(info.sparse_file, aux_info.backup_sb[i],
+						info.block_size, group_start_block);
 			}
-			header_size = 1 + aux_info.bg_desc_blocks + aux_info.bg_desc_reserve_blocks;
+			sparse_file_add_data(info.sparse_file, aux_info.bg_desc,
+				aux_info.bg_desc_blocks * info.block_size,
+				group_start_block + 1);
+			header_size = 1 + aux_info.bg_desc_blocks + info.bg_desc_reserve_blocks;
 		}
 
 		aux_info.bg_desc[i].bg_block_bitmap = group_start_block + header_size;
@@ -258,6 +243,53 @@ void ext4_fill_in_sb()
 		aux_info.bg_desc[i].bg_free_inodes_count = sb->s_inodes_per_group;
 		aux_info.bg_desc[i].bg_used_dirs_count = 0;
 	}
+}
+
+void ext4_queue_sb(void)
+{
+	/* The write_data* functions expect only block aligned calls.
+	 * This is not an issue, except when we write out the super
+	 * block on a system with a block size > 1K.  So, we need to
+	 * deal with that here.
+	 */
+	if (info.block_size > 1024) {
+		u8 *buf = calloc(info.block_size, 1);
+		memcpy(buf + 1024, (u8*)aux_info.sb, 1024);
+		sparse_file_add_data(info.sparse_file, buf, info.block_size, 0);
+	} else {
+		sparse_file_add_data(info.sparse_file, aux_info.sb, 1024, 1);
+	}
+}
+
+void ext4_parse_sb(struct ext4_super_block *sb)
+{
+	if (sb->s_magic != EXT4_SUPER_MAGIC)
+		error("superblock magic incorrect");
+
+	if ((sb->s_state & EXT4_VALID_FS) != EXT4_VALID_FS)
+		error("filesystem state not valid");
+
+	info.block_size = 1024 << sb->s_log_block_size;
+	info.blocks_per_group = sb->s_blocks_per_group;
+	info.inodes_per_group = sb->s_inodes_per_group;
+	info.inode_size = sb->s_inode_size;
+	info.inodes = sb->s_inodes_count;
+	info.feat_ro_compat = sb->s_feature_ro_compat;
+	info.feat_compat = sb->s_feature_compat;
+	info.feat_incompat = sb->s_feature_incompat;
+	info.bg_desc_reserve_blocks = sb->s_reserved_gdt_blocks;
+	info.label = sb->s_volume_name;
+
+	aux_info.len_blocks = ((u64)sb->s_blocks_count_hi << 32) +
+			sb->s_blocks_count_lo;
+	info.len = (u64)info.block_size * aux_info.len_blocks;
+
+	ext4_create_fs_aux_info();
+
+	memcpy(aux_info.sb, sb, sizeof(*sb));
+
+	if (aux_info.first_data_block != sb->s_first_data_block)
+		critical_error("first data block does not match");
 }
 
 void ext4_create_resize_inode()
@@ -278,7 +310,7 @@ void ext4_create_resize_inode()
 				info.blocks_per_group;
 			u32 reserved_block_start = group_start_block + 1 +
 				aux_info.bg_desc_blocks;
-			u32 reserved_block_len = aux_info.bg_desc_reserve_blocks;
+			u32 reserved_block_len = info.bg_desc_reserve_blocks;
 			append_region(reserve_inode_alloc, reserved_block_start,
 				reserved_block_len, i);
 			reserve_inode_len += reserved_block_len;
@@ -346,24 +378,19 @@ void ext4_update_free()
 	}
 }
 
-static u64 get_block_device_size(const char *filename)
+static u64 get_block_device_size(int fd)
 {
-	int fd = open(filename, O_RDONLY);
 	u64 size = 0;
 	int ret;
-
-	if (fd < 0)
-		return 0;
 
 #if defined(__linux__)
 	ret = ioctl(fd, BLKGETSIZE64, &size);
 #elif defined(__APPLE__) && defined(__MACH__)
 	ret = ioctl(fd, DKIOCGETBLOCKCOUNT, &size);
 #else
+	close(fd);
 	return 0;
 #endif
-
-	close(fd);
 
 	if (ret)
 		return 0;
@@ -371,21 +398,33 @@ static u64 get_block_device_size(const char *filename)
 	return size;
 }
 
-u64 get_file_size(const char *filename)
+u64 get_file_size(int fd)
 {
 	struct stat buf;
 	int ret;
+	u64 reserve_len = 0;
+	s64 computed_size;
 
-	ret = stat(filename, &buf);
+	ret = fstat(fd, &buf);
 	if (ret)
 		return 0;
 
+	if (info.len < 0)
+		reserve_len = -info.len;
+
 	if (S_ISREG(buf.st_mode))
-		return buf.st_size;
+		computed_size = buf.st_size - reserve_len;
 	else if (S_ISBLK(buf.st_mode))
-		return get_block_device_size(filename);
+		computed_size = get_block_device_size(fd) - reserve_len;
 	else
-		return 0;
+		computed_size = 0;
+
+	if (computed_size < 0) {
+		warn("Computed filesystem size less than 0");
+		computed_size = 0;
+	}
+
+	return computed_size;
 }
 
 u64 parse_num(const char *arg)
@@ -401,4 +440,3 @@ u64 parse_num(const char *arg)
 
 	return num;
 }
-

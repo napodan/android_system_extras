@@ -14,15 +14,16 @@
  * limitations under the License.
  */
 
-#include <stdlib.h>
-#include <stdio.h>
-
 #include "ext4_utils.h"
 #include "ext4.h"
 #include "ext4_extents.h"
-#include "backed_block.h"
-
 #include "extent.h"
+
+#include <sparse/sparse.h>
+
+#include <stdlib.h>
+#include <stdio.h>
+
 
 /* Creates data buffers for the first backing_len bytes of a block allocation
    and queues them to be written */
@@ -42,7 +43,7 @@ static u8 *extent_create_backing(struct block_allocation *alloc,
 
 		len = min(region_len * info.block_size, backing_len);
 
-		queue_data_block(ptr, len, region_block);
+		sparse_file_add_data(info.sparse_file, ptr, len, region_block);
 		ptr += len;
 		backing_len -= len;
 	}
@@ -55,7 +56,7 @@ static u8 *extent_create_backing(struct block_allocation *alloc,
 static void extent_create_backing_file(struct block_allocation *alloc,
 	u64 backing_len, const char *filename)
 {
-	off_t offset = 0;
+	off64_t offset = 0;
 	for (; alloc != NULL && backing_len > 0; get_next_region(alloc)) {
 		u32 region_block;
 		u32 region_len;
@@ -64,7 +65,8 @@ static void extent_create_backing_file(struct block_allocation *alloc,
 
 		len = min(region_len * info.block_size, backing_len);
 
-		queue_data_file(filename, offset, len, region_block);
+		sparse_file_add_file(info.sparse_file, filename, offset, len,
+				region_block);
 		offset += len;
 		backing_len -= len;
 	}
@@ -123,7 +125,8 @@ static struct block_allocation *do_inode_allocate_extents(
 		if (!data)
 			critical_error_errno("calloc");
 
-		queue_data_block(data, info.block_size, extent_block);
+		sparse_file_add_data(info.sparse_file, data, info.block_size,
+				extent_block);
 
 		if (((int)(info.block_size - sizeof(struct ext4_extent_header) /
 				sizeof(struct ext4_extent))) < allocation_len) {
