@@ -14,28 +14,9 @@
  * limitations under the License.
  */
 
-#ifndef _DIRECTORY_H_
-#define _DIRECTORY_H_
+#ifndef _WIPE_H_
+#define _WIPE_H_
 
-struct dentry {
-	char *path;
-	char *full_path;
-	const char *filename;
-	char *link;
-	unsigned long size;
-	u8 file_type;
-	u16 mode;
-	u16 uid;
-	u16 gid;
-	u32 *inode;
-	u32 mtime;
-	char *secon;
-};
+int wipe_block_device(int fd, s64 len);
 
-u32 make_directory(u32 dir_inode_num, u32 entries, struct dentry *dentries,
-	u32 dirs);
-u32 make_file(const char *filename, u64 len);
-u32 make_link(const char *filename, const char *link);
-int inode_set_permissions(u32 inode_num, u16 mode, u16 uid, u16 gid, u32 mtime);
-int inode_set_selinux(u32 inode_num, const char *secon);
 #endif

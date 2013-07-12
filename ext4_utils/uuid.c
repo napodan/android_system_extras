@@ -15,15 +15,21 @@
  */
 
 #include <string.h>
+
+#ifdef USE_MINGW
+#include <winsock2.h>
+#else
 #include <arpa/inet.h>
+#endif
 
 #include "ext4_utils.h"
 #include "sha1.h"
 #include "uuid.h"
 
+/* Definition from RFC-4122 */
 struct uuid {
 	u32 time_low;
-	u32 time_mid;
+	u16 time_mid;
 	u16 time_hi_and_version;
 	u8 clk_seq_hi_res;
 	u8 clk_seq_low;
