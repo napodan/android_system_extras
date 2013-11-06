@@ -68,6 +68,7 @@ sources := \
     common/test_pthread_getcpuclockid.c \
     common/test_pthread_join.c \
     common/test_pthread_mutex.c \
+    common/test_pthread_rwlock.c \
     common/test_pthread_once.c \
     common/test_semaphore.c \
     common/test_sem_post.c \
